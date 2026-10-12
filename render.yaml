@@ -1,0 +1,17 @@
+# One-click deploy on Render (free plan): Dashboard → New → Blueprint → pick this repo.
+# The Express server serves the built React app, the REST API and the WebSocket on one port.
+services:
+  - type: web
+    name: dash-pure-analytics
+    runtime: node
+    plan: free
+    buildCommand: npm run setup && npm run build
+    startCommand: npm --prefix backend start
+    healthCheckPath: /api/system/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "20"
+      - key: JWT_SECRET
+        generateValue: true

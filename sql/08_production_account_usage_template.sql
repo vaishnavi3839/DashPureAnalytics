@@ -1,0 +1,77 @@
+-- Template for real Snowflake usage data (not run locally).
+-- Needs the backend to tag each query, e.g.
+--   ALTER SESSION SET QUERY_TAG = '{"app":"dashpureanalytics","report_id":"RPT_223"}';
+-- ACCOUNT_USAGE lags a few hours, so this is for daily cost reports, not live alerts.
+
+USE SCHEMA DASHPUREANALYTICS.ADMIN_MONITORING;
+
+-- credits per report for the last 30 days, with warehouse idle time shared out pro-rata
+CREATE OR REPLACE VIEW PROD_REPORT_CREDITS_30D AS
+WITH tagged AS (
+    SELECT
+        TRY_PARSE_JSON(QUERY_TAG):report_id::STRING        AS REPORT_ID,
+        WAREHOUSE_NAME,
+        CREDITS_ATTRIBUTED_COMPUTE + COALESCE(CREDITS_USED_QUERY_ACCELERATION, 0) AS CREDITS
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_ATTRIBUTION_HISTORY
+    WHERE START_TIME >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+      AND TRY_PARSE_JSON(QUERY_TAG):app::STRING = 'dashpureanalytics'
+),
+attributed AS (
+    SELECT WAREHOUSE_NAME, SUM(CREDITS) AS ATTRIBUTED_CREDITS
+    FROM tagged GROUP BY WAREHOUSE_NAME
+),
+metered AS (
+    SELECT WAREHOUSE_NAME, SUM(CREDITS_USED_COMPUTE) AS METERED_CREDITS
+    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+    WHERE START_TIME >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+    GROUP BY WAREHOUSE_NAME
+)
+SELECT
+    t.REPORT_ID,
+    t.WAREHOUSE_NAME,
+    SUM(t.CREDITS)                                                         AS ATTRIBUTED_CREDITS,
+    -- this report's share of the idle credits
+    SUM(t.CREDITS) / NULLIF(a.ATTRIBUTED_CREDITS, 0)
+        * GREATEST(m.METERED_CREDITS - a.ATTRIBUTED_CREDITS, 0)           AS IDLE_CREDITS_ALLOCATED,
+    SUM(t.CREDITS) + SUM(t.CREDITS) / NULLIF(a.ATTRIBUTED_CREDITS, 0)
+        * GREATEST(m.METERED_CREDITS - a.ATTRIBUTED_CREDITS, 0)           AS FULLY_LOADED_CREDITS
+FROM tagged t
+JOIN attributed a ON a.WAREHOUSE_NAME = t.WAREHOUSE_NAME
+LEFT JOIN metered m ON m.WAREHOUSE_NAME = t.WAREHOUSE_NAME
+WHERE t.REPORT_ID IS NOT NULL
+GROUP BY t.REPORT_ID, t.WAREHOUSE_NAME, a.ATTRIBUTED_CREDITS, m.METERED_CREDITS;
+
+-- cost per view. APP_VIEW_EVENTS would be the portal's own page-view log.
+SELECT
+    c.REPORT_ID,
+    SUM(c.FULLY_LOADED_CREDITS)                                                     AS CREDITS_30D,
+    SUM(c.FULLY_LOADED_CREDITS) * (SELECT CONFIG_VALUE FROM COST_CONFIG WHERE CONFIG_KEY = 'CREDIT_PRICE_USD') AS COST_USD_30D,
+    v.VIEWS_30D,
+    v.ACTIVE_USERS_30D,
+    SUM(c.FULLY_LOADED_CREDITS) * (SELECT CONFIG_VALUE FROM COST_CONFIG WHERE CONFIG_KEY = 'CREDIT_PRICE_USD')
+        / NULLIF(v.VIEWS_30D, 0)                                                    AS COST_PER_VIEW_USD
+FROM PROD_REPORT_CREDITS_30D c
+LEFT JOIN (
+    SELECT REPORT_ID, COUNT(*) AS VIEWS_30D, COUNT(DISTINCT USER_EMAIL) AS ACTIVE_USERS_30D
+    FROM APP_VIEW_EVENTS
+    WHERE VIEWED_AT >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+    GROUP BY REPORT_ID
+) v ON v.REPORT_ID = c.REPORT_ID
+GROUP BY c.REPORT_ID, v.VIEWS_30D, v.ACTIVE_USERS_30D
+ORDER BY COST_PER_VIEW_USD DESC NULLS LAST;
+
+-- optional email backup for refresh failures (the live alerts come from the Node app).
+-- needs a notification integration called PI_EMAIL_INT
+CREATE OR REPLACE ALERT PI_REFRESH_FAILURE_ALERT
+  WAREHOUSE = ADMIN_MONITORING_WH
+  SCHEDULE  = '15 MINUTE'
+  IF (EXISTS (
+      SELECT 1 FROM RPT_CURRENT_STATE
+      WHERE LAST_REFRESH_STATUS IN ('FAILED', 'TIMED_OUT')
+  ))
+  THEN CALL SYSTEM$SEND_EMAIL(
+      'PI_EMAIL_INT',
+      'analytics-platform-admins@company.com',
+      'DashPureAnalytics: report refresh failures detected',
+      'One or more reports have FAILED / TIMED_OUT refreshes. See the Command Centre dashboard.');
+-- ALTER ALERT PI_REFRESH_FAILURE_ALERT RESUME;

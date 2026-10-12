@@ -1,0 +1,13 @@
+node_modules/
+frontend/dist/
+.env
+*.log
+.DS_Store
+__pycache__/
+sql/output/
+.env.*
+!.env.example
+!.env.*.example
+.next/
+.venv/
+venv/

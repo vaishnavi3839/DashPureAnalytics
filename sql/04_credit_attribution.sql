@@ -1,0 +1,40 @@
+-- Snowflake credits and cost per report.
+-- Negative credits are NULL in SNOWFLAKE_CREDITS_VALID, so SUM skips them.
+
+CREATE OR REPLACE VIEW RPT_CREDIT_ATTRIBUTION AS
+WITH price AS (
+    SELECT CONFIG_VALUE AS CREDIT_PRICE_USD FROM COST_CONFIG WHERE CONFIG_KEY = 'CREDIT_PRICE_USD'
+),
+per_report AS (
+    SELECT
+        REPORT_ID,
+        MAX(REPORT_NAME)                                                AS REPORT_NAME,
+        COUNT(*)                                                        AS SNAPSHOTS,
+        SUM(SNOWFLAKE_CREDITS_VALID)                                    AS CREDITS_CONSUMED,
+        SUM(CASE WHEN IS_NEGATIVE_CREDITS THEN 1 ELSE 0 END)            AS NEGATIVE_CREDIT_ROWS_EXCLUDED,
+        SUM(CASE WHEN SNOWFLAKE_CREDITS_VALID IS NOT NULL THEN QUERY_COUNT_LAST_30D END) AS QUERIES_ON_VALID_ROWS
+    FROM STG_REPORT_USAGE
+    GROUP BY REPORT_ID
+)
+SELECT
+    r.REPORT_ID,
+    r.REPORT_NAME,
+    r.SNAPSHOTS,
+    ROUND(r.CREDITS_CONSUMED, 2)                                                  AS CREDITS_CONSUMED,
+    ROUND(r.CREDITS_CONSUMED * p.CREDIT_PRICE_USD, 2)                             AS SNOWFLAKE_COST_USD,
+    ROUND(100.0 * r.CREDITS_CONSUMED / SUM(r.CREDITS_CONSUMED) OVER (), 2)        AS CREDIT_SHARE_PCT,
+    DENSE_RANK() OVER (ORDER BY r.CREDITS_CONSUMED DESC)                          AS CREDIT_RANK,
+    -- running share, to see how concentrated the spend is
+    ROUND(100.0 * SUM(r.CREDITS_CONSUMED) OVER (ORDER BY r.CREDITS_CONSUMED DESC, r.REPORT_ID
+                                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                / SUM(r.CREDITS_CONSUMED) OVER (), 2)                             AS CUMULATIVE_SHARE_PCT,
+    ROUND(1000.0 * r.CREDITS_CONSUMED / NULLIF(r.QUERIES_ON_VALID_ROWS, 0), 3)    AS CREDITS_PER_1K_QUERIES,
+    r.NEGATIVE_CREDIT_ROWS_EXCLUDED
+FROM per_report r
+CROSS JOIN price p;
+
+-- top 15 by credits
+SELECT *
+FROM RPT_CREDIT_ATTRIBUTION
+ORDER BY CREDIT_RANK
+LIMIT 15;
