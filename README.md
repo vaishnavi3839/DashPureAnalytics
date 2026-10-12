@@ -2,7 +2,6 @@
 
 **Case Study 3: Technical Data AI Validation – Monetization**
 
-Demo video: _add link here_  
 Live app: https://dash-pure-analytics.onrender.com
 
 ## About the project
